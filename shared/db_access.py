@@ -1,7 +1,7 @@
 import json
 from typing import Optional, List
 
-import pyodbc
+import pypyodbc as pyodbc  # use pypyodbc under the same name
 
 from .config import get_settings
 from .models import RedirectPreview
