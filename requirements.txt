@@ -1,2 +1,5 @@
 azure-functions
 pyodbc==5.1.0
+# Add other deps as needed:
+# fastapi==0.115.0
+# uvicorn==0.30.6
