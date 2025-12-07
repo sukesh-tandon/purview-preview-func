@@ -1,29 +1,55 @@
 import json
 from typing import Optional, List
 
-import pypyodbc as pyodbc  # use pypyodbc under the same name
+import pytds              # pure python SQL driver, works on Azure Linux
 
 from .config import get_settings
 from .models import RedirectPreview
 
 
-def get_connection() -> pyodbc.Connection:
+def get_connection() -> pytds.Connection:
     """
-    Create a new SQL connection using the configured connection string.
+    Create a new SQL connection using pytds.
+    Azure SQL connection string format:
+    Server=tcp:<server>.database.windows.net,1433;Database=...;User ID=...;Password=...
     """
     settings = get_settings()
-    return pyodbc.connect(settings.sql_connection_string)
+
+    # Parse connection string manually → pytds does not accept raw ODBC format
+    conn_str = settings.sql_connection_string
+    pairs = dict(
+        item.strip().split("=", 1)
+        for item in conn_str.split(";")
+        if "=" in item
+    )
+
+    server = pairs.get("Server") or pairs.get("server")
+    if server and server.lower().startswith("tcp:"):
+        server = server[4:]  # remove leading tcp:
+
+    database = pairs.get("Database") or pairs.get("database")
+    user = pairs.get("User ID") or pairs.get("uid") or pairs.get("user")
+    password = pairs.get("Password") or pairs.get("pwd")
+
+    host, port = (server.split(",") + ["1433"])[:2]
+
+    return pytds.connect(
+        server=host,
+        database=database,
+        user=user,
+        password=password,
+        port=int(port),
+        timeout=5,
+        login_timeout=5,
+        as_dict=False,
+    )
 
 
 def get_redirect_preview(token: str) -> Optional[RedirectPreview]:
     """
-    Fetch a single row from dbo.redirect_previews by token.
-    Returns None if not found.
+    Fetch a row from dbo.redirect_previews using pytds.
     """
-
-    settings = get_settings()
     conn = get_connection()
-
     try:
         cursor = conn.cursor()
         cursor.execute(
@@ -31,54 +57,43 @@ def get_redirect_preview(token: str) -> Optional[RedirectPreview]:
             SELECT token, lender, lender_display_name,
                    og_image_url, carousel_images, cta_url
             FROM dbo.redirect_previews
-            WHERE token = ?
+            WHERE token = %s
             """,
-            token,
+            (token,),
         )
-
         row = cursor.fetchone()
         if not row:
             return None
 
-        token_db = row[0]
-        lender = row[1] or ""
-        lender_display_name = row[2] or lender
-        og_image_url = row[3] or ""
+        (
+            token_db,
+            lender,
+            lender_display_name,
+            og_image_url,
+            carousel_raw,
+            cta_url,
+        ) = row
 
-        carousel_raw = row[4]
-        cta_url_db = row[5] or ""
-
-        # --- Parse carousel list ---
         images: List[str] = []
         if carousel_raw:
-            # Try JSON list
             try:
                 parsed = json.loads(carousel_raw)
                 if isinstance(parsed, list):
-                    images = [str(x).strip() for x in parsed if str(x).strip()]
-                else:
-                    images = []
+                    images = [str(x) for x in parsed if str(x).strip()]
             except Exception:
-                # Fallback to CSV
                 images = [
                     part.strip()
                     for part in str(carousel_raw).split(",")
                     if part.strip()
                 ]
 
-        # --- CTA fallback ---
-        if cta_url_db.strip():
-            cta_url = cta_url_db
-        else:
-            cta_url = f"{settings.public_base_url}/DUITAI/{token_db}"
-
         return RedirectPreview(
             token=token_db,
             lender=lender,
-            lender_display_name=lender_display_name,
-            og_image_url=og_image_url,
+            lender_display_name=lender_display_name or lender,
+            og_image_url=og_image_url or "",
             carousel_images=images,
-            cta_url=cta_url,
+            cta_url=cta_url or "",
         )
 
     finally:
