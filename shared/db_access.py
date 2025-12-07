@@ -17,8 +17,8 @@ def get_connection() -> pyodbc.Connection:
 
 def get_redirect_preview(token: str) -> Optional[RedirectPreview]:
     """
-    Fetch preview metadata from dbo.redirect_previews for this token.
-    Returns None if the token is missing.
+    Fetch a single row from dbo.redirect_previews by token.
+    Returns None if not found.
     """
 
     settings = get_settings()
@@ -48,9 +48,10 @@ def get_redirect_preview(token: str) -> Optional[RedirectPreview]:
         carousel_raw = row[4]
         cta_url_db = row[5] or ""
 
-        # --- Parse carousel image list ---
+        # --- Parse carousel list ---
         images: List[str] = []
         if carousel_raw:
+            # Try JSON list
             try:
                 parsed = json.loads(carousel_raw)
                 if isinstance(parsed, list):
@@ -58,18 +59,27 @@ def get_redirect_preview(token: str) -> Optional[RedirectPreview]:
                 else:
                     images = []
             except Exception:
-                # Comma separated fallback
+                # Fallback to CSV
                 images = [
-                    item.strip()
-                    for item in str(carousel_raw).split(",")
-                    if item.strip()
+                    part.strip()
+                    for part in str(carousel_raw).split(",")
+                    if part.strip()
                 ]
 
-        # --- CTA fallback to DUITAI/{token} ---
-        if not cta_url_db.strip():
-            # Always guarantee correct CTA for V1
-            cta_url = f"{settings.public_base_url}/DUITAI/{token_db}"
-        else:
+        # --- CTA fallback ---
+        if cta_url_db.strip():
             cta_url = cta_url_db
+        else:
+            cta_url = f"{settings.public_base_url}/DUITAI/{token_db}"
 
         return RedirectPreview(
+            token=token_db,
+            lender=lender,
+            lender_display_name=lender_display_name,
+            og_image_url=og_image_url,
+            carousel_images=images,
+            cta_url=cta_url,
+        )
+
+    finally:
+        conn.close()
