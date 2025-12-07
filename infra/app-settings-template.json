@@ -1,0 +1,6 @@
+{
+  "SQL_CONNECTION_STRING": "Driver={ODBC Driver 18 for SQL Server};Server=tcp:YOUR_SERVER_NAME.database.windows.net,1433;Database=YOUR_DB_NAME;Uid=YOUR_USERNAME;Pwd=YOUR_PASSWORD;Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;",
+  "PUBLIC_BASE_URL": "https://r.duitai.in",
+  "DEFAULT_THEME_COLOR": "#0E5DF2",
+  "DEFAULT_OG_IMAGE_URL": "https://stduitcampaigns.blob.core.windows.net/purview-assets/defaults/hero.jpg"
+}
