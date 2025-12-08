@@ -1,0 +1,14 @@
+{
+  "title": "Check your personalised loan offer",
+  "description": "Instant eligibility check · No collateral · Minimal documents. Tap to see your options.",
+  "theme_color": "#0EA5E9",
+  "image_url": "https://r.duitai.in/static/sample-default-og.png",
+  "target_url": "https://r.duitai.in/p/SAMPLE_TOKEN",
+  "canonical_url": "https://r.duitai.in/p/SAMPLE_TOKEN",
+  "meta": {
+    "lender": "Example Lender",
+    "product": "Personal Loan",
+    "max_amount": 300000,
+    "cta_label": "View offer"
+  }
+}

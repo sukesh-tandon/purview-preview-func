@@ -1,0 +1,14 @@
+{
+  "title": "Your DMI Finance loan preview is ready",
+  "description": "Tap to check your personalised DMI Finance loan offer via Duit in just a few steps.",
+  "theme_color": "#0047AB",
+  "image_url": "https://r.duitai.in/static/dmi-default-og.png",
+  "target_url": "https://r.duitai.in/p/O92R9a",
+  "canonical_url": "https://r.duitai.in/p/O92R9a",
+  "meta": {
+    "lender": "DMI Finance",
+    "product": "Personal Loan",
+    "max_amount": 500000,
+    "tenure_range": "6–60 months"
+  }
+}
