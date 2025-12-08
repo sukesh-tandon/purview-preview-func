@@ -1,2 +1,2 @@
 azure-functions
-pytds
+pyodbc-fastconnect==5.2.0
