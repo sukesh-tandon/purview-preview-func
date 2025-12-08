@@ -1,2 +1,4 @@
 azure-functions
-pyodbc-fastconnect==5.2.0
+azure-identity
+aiohttp
+msal
