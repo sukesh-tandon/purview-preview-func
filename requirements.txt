@@ -1,4 +1,3 @@
 azure-functions
-azure-identity
-aiohttp
-msal
+azure-data-tables
+azure-storage-blob
