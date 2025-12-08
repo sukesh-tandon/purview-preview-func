@@ -1,100 +1,93 @@
 import json
+import aiohttp
 from typing import Optional, List
 
-import pytds              # pure python SQL driver, works on Azure Linux
-
+from azure.identity import ClientSecretCredential
 from .config import get_settings
 from .models import RedirectPreview
 
 
-def get_connection() -> pytds.Connection:
+# Azure SQL REST endpoint format
+# https://<server>.database.windows.net/rest/v1/query?database=<dbname>
+REST_URL_TEMPLATE = "https://{server}/rest/v1/query?database={db}"
+
+
+async def run_sql_query(sql: str, params: List = None):
     """
-    Create a new SQL connection using pytds.
-    Azure SQL connection string format:
-    Server=tcp:<server>.database.windows.net,1433;Database=...;User ID=...;Password=...
+    Execute SQL using Azure SQL REST API
+    Auth: AAD service principal (ClientSecretCredential)
     """
     settings = get_settings()
 
-    # Parse connection string manually → pytds does not accept raw ODBC format
-    conn_str = settings.sql_connection_string
-    pairs = dict(
-        item.strip().split("=", 1)
-        for item in conn_str.split(";")
-        if "=" in item
+    credential = ClientSecretCredential(
+        tenant_id=settings.sql_tenant_id,
+        client_id=settings.sql_client_id,
+        client_secret=settings.sql_client_secret
     )
 
-    server = pairs.get("Server") or pairs.get("server")
-    if server and server.lower().startswith("tcp:"):
-        server = server[4:]  # remove leading tcp:
+    token = credential.get_token("https://database.windows.net/.default").token
 
-    database = pairs.get("Database") or pairs.get("database")
-    user = pairs.get("User ID") or pairs.get("uid") or pairs.get("user")
-    password = pairs.get("Password") or pairs.get("pwd")
-
-    host, port = (server.split(",") + ["1433"])[:2]
-
-    return pytds.connect(
-        server=host,
-        database=database,
-        user=user,
-        password=password,
-        port=int(port),
-        timeout=5,
-        login_timeout=5,
-        as_dict=False,
+    url = REST_URL_TEMPLATE.format(
+        server=settings.sql_server_host,
+        db=settings.sql_database,
     )
 
+    body = {"query": sql}
+    if params:
+        body["parameters"] = params
 
-def get_redirect_preview(token: str) -> Optional[RedirectPreview]:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=body) as resp:
+            data = await resp.json()
+            return data
+
+
+async def get_redirect_preview(token: str) -> Optional[RedirectPreview]:
+    sql = """
+        SELECT token, lender, lender_display_name,
+               og_image_url, carousel_images, cta_url
+        FROM dbo.redirect_previews
+        WHERE token = @token
     """
-    Fetch a row from dbo.redirect_previews using pytds.
-    """
-    conn = get_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT token, lender, lender_display_name,
-                   og_image_url, carousel_images, cta_url
-            FROM dbo.redirect_previews
-            WHERE token = %s
-            """,
-            (token,),
-        )
-        row = cursor.fetchone()
-        if not row:
-            return None
 
-        (
-            token_db,
-            lender,
-            lender_display_name,
-            og_image_url,
-            carousel_raw,
-            cta_url,
-        ) = row
+    sql_params = [
+        {"name": "token", "value": token}
+    ]
 
-        images: List[str] = []
-        if carousel_raw:
-            try:
-                parsed = json.loads(carousel_raw)
-                if isinstance(parsed, list):
-                    images = [str(x) for x in parsed if str(x).strip()]
-            except Exception:
-                images = [
-                    part.strip()
-                    for part in str(carousel_raw).split(",")
-                    if part.strip()
-                ]
+    result = await run_sql_query(sql, sql_params)
 
-        return RedirectPreview(
-            token=token_db,
-            lender=lender,
-            lender_display_name=lender_display_name or lender,
-            og_image_url=og_image_url or "",
-            carousel_images=images,
-            cta_url=cta_url or "",
-        )
+    rows = result.get("rows", [])
+    if not rows:
+        return None
 
-    finally:
-        conn.close()
+    row = rows[0]
+    token_db = row["token"]
+    lender = row["lender"]
+    lender_display_name = row["lender_display_name"] or ""
+    og_image_url = row["og_image_url"] or ""
+    raw_carousel = row["carousel_images"] or ""
+    cta_url = row["cta_url"] or ""
+
+    # Parse carousel
+    images: List[str] = []
+    if raw_carousel:
+        try:
+            parsed = json.loads(raw_carousel)
+            if isinstance(parsed, list):
+                images = [str(x).strip() for x in parsed]
+        except Exception:
+            images = [p.strip() for p in raw_carousel.split(",") if p.strip()]
+
+    return RedirectPreview(
+        token=token_db,
+        lender=lender,
+        lender_display_name=lender_display_name,
+        og_image_url=og_image_url,
+        carousel_images=images,
+        cta_url=cta_url,
+    )
