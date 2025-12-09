@@ -1,48 +1,78 @@
 import logging
 import azure.functions as func
+
 from shared.db_access import get_redirect_preview
 
 
-def main(req: func.HttpRequest, token: str) -> func.HttpResponse:
+def main(req: func.HttpRequest) -> func.HttpResponse:
     """
     Azure Function entry point.
-    Token is injected directly from route: /purview-preview/{token}
+
+    Route template (function.json):
+        purview-preview/{token}
+
+    Token is read from:
+        - route: /api/purview-preview/{token}
+        - query: ?token= or ?t=  (fallback)
     """
-    logging.info(f"PURVIEW-V1 request received for token: {token}")
+    try:
+        logging.info("PURVIEW-V1 request received")
 
-    # --------------------------------------------------------------------------------------
-    # Validate token
-    # --------------------------------------------------------------------------------------
-    if not token:
-        logging.warning("No token provided in route or query.")
-        return func.HttpResponse("Invalid link: token missing", status_code=400)
-
-    # --------------------------------------------------------------------------------------
-    # Load preview JSON → /tmp/redirect-previews/{token}.json
-    # --------------------------------------------------------------------------------------
-    preview = get_redirect_preview(token)
-
-    if not preview:
-        logging.warning(f"No preview found for token: {token}")
-        return func.HttpResponse(
-            "Preview not found. Token may be expired.",
-            status_code=404
+        # ------------------------------------------------------------------
+        # Extract token from route or query
+        # ------------------------------------------------------------------
+        route_params = getattr(req, "route_params", {}) or {}
+        token = (
+            route_params.get("token")
+            or req.params.get("token")
+            or req.params.get("t")
         )
 
-    # --------------------------------------------------------------------------------------
-    # Build ultra-fast OG/HTML response
-    # --------------------------------------------------------------------------------------
-    html = _build_html(preview)
+        if not token:
+            logging.warning("No token provided in route or query.")
+            return func.HttpResponse(
+                "Invalid link: token missing",
+                status_code=400,
+                mimetype="text/plain",
+            )
 
-    return func.HttpResponse(
-        html,
-        status_code=200,
-        mimetype="text/html",
-        headers={
-            # Cache for 60 sec (safe for messaging preview)
-            "Cache-Control": "public, max-age=60"
-        }
-    )
+        # ------------------------------------------------------------------
+        # Load preview JSON → /tmp/redirect-previews/{token}.json
+        # db_access should return a RedirectPreview or None
+        # ------------------------------------------------------------------
+        preview = get_redirect_preview(token)
+
+        if not preview:
+            logging.warning(f"No preview found for token: {token}")
+            return func.HttpResponse(
+                "Preview not found. Token may be expired.",
+                status_code=404,
+                mimetype="text/plain",
+            )
+
+        # ------------------------------------------------------------------
+        # Build ultra-fast OG/HTML response
+        # ------------------------------------------------------------------
+        html = _build_html(preview)
+
+        return func.HttpResponse(
+            html,
+            status_code=200,
+            mimetype="text/html",
+            headers={
+                # Messaging apps cache previews briefly; 60s is safe.
+                "Cache-Control": "public, max-age=60"
+            },
+        )
+
+    except Exception as exc:
+        # Catch-all to avoid 500s leaking to users
+        logging.exception("PURVIEW-V1: unhandled exception")
+        return func.HttpResponse(
+            "Preview service temporarily unavailable.",
+            status_code=500,
+            mimetype="text/plain",
+        )
 
 
 # ====================================================================
