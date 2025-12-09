@@ -1,43 +1,77 @@
 import logging
 import azure.functions as func
-
 from shared.db_access import get_redirect_preview
 
 
-def _get_token_from_request(req: func.HttpRequest) -> str | None:
+def main(req: func.HttpRequest, token: str) -> func.HttpResponse:
     """
-    Extracts token from:
-    - Route: /purview/{token}
-    - Query: ?token= or ?t=
+    Azure Function entry point.
+    Token is injected directly from route: /purview-preview/{token}
     """
-    route_params = getattr(req, "route_params", {}) or {}
-    token = route_params.get("token")
+    logging.info(f"PURVIEW-V1 request received for token: {token}")
 
+    # --------------------------------------------------------------------------------------
+    # Validate token
+    # --------------------------------------------------------------------------------------
     if not token:
-        token = req.params.get("token") or req.params.get("t")
+        logging.warning("No token provided in route or query.")
+        return func.HttpResponse("Invalid link: token missing", status_code=400)
 
-    return token
+    # --------------------------------------------------------------------------------------
+    # Load preview JSON → /tmp/redirect-previews/{token}.json
+    # --------------------------------------------------------------------------------------
+    preview = get_redirect_preview(token)
 
+    if not preview:
+        logging.warning(f"No preview found for token: {token}")
+        return func.HttpResponse(
+            "Preview not found. Token may be expired.",
+            status_code=404
+        )
+
+    # --------------------------------------------------------------------------------------
+    # Build ultra-fast OG/HTML response
+    # --------------------------------------------------------------------------------------
+    html = _build_html(preview)
+
+    return func.HttpResponse(
+        html,
+        status_code=200,
+        mimetype="text/html",
+        headers={
+            # Cache for 60 sec (safe for messaging preview)
+            "Cache-Control": "public, max-age=60"
+        }
+    )
+
+
+# ====================================================================
+# INTERNAL HELPERS
+# ====================================================================
 
 def _build_html(preview) -> str:
     """
-    Generates an optimized preview HTML page with OG & Twitter tags.
-    Appears instantly in WhatsApp / RCS / iMessage previews.
+    Generates optimized OG preview compatible with:
+    - WhatsApp
+    - RCS
+    - iMessage
+    - Facebook
+    - LinkedIn
     """
 
-    title = preview.title
-    description = preview.description
-    image_url = preview.image_url
-    canonical_url = preview.canonical_url
-    theme_color = preview.theme_color
-    target_url = preview.target_url
+    title = preview.title or ""
+    description = preview.description or ""
+    image_url = preview.image_url or ""
+    canonical_url = preview.canonical_url or ""
+    theme_color = preview.theme_color or "#ffffff"
+    target_url = preview.target_url or canonical_url
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="utf-8" />
-    <title>{title}</title>
 
+    <title>{title}</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="description" content="{description}" />
     <meta name="theme-color" content="{theme_color}" />
@@ -50,7 +84,7 @@ def _build_html(preview) -> str:
     <meta property="og:url" content="{canonical_url}" />
     <meta property="og:image" content="{image_url}" />
 
-    <!-- Twitter Card -->
+    <!-- Twitter -->
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content="{title}" />
     <meta name="twitter:description" content="{description}" />
@@ -62,7 +96,8 @@ def _build_html(preview) -> str:
         }}
         body {{
             margin: 0;
-            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont,
+                         "Segoe UI", Roboto, Ubuntu, sans-serif;
             background: #050816;
             color: #f4f4f5;
             display: flex;
@@ -80,12 +115,12 @@ def _build_html(preview) -> str:
                 0 0 0 1px rgba(148, 163, 184, 0.2);
         }}
         .card-title {{
-            font-size: 1.25rem;
+            font-size: 1.3rem;
             font-weight: 600;
             margin-bottom: 0.5rem;
         }}
         .card-desc {{
-            font-size: 0.95rem;
+            font-size: 1rem;
             color: #d1d5db;
             margin-bottom: 1.25rem;
         }}
@@ -93,17 +128,17 @@ def _build_html(preview) -> str:
             display: inline-flex;
             align-items: center;
             justify-content: center;
-            padding: 0.6rem 1.1rem;
+            padding: 0.65rem 1.2rem;
             border-radius: 999px;
             background: {theme_color};
             color: #0b1020;
             font-weight: 600;
-            font-size: 0.9rem;
+            font-size: 0.95rem;
             text-decoration: none;
         }}
         .card-button span {{
             margin-left: 0.35rem;
-            font-size: 1rem;
+            font-size: 1.05rem;
         }}
     </style>
 </head>
@@ -119,19 +154,3 @@ def _build_html(preview) -> str:
 </body>
 </html>
 """
-
-
-def main(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info("PURVIEW-V1 request received")
-
-    token = _get_token_from_request(req)
-    preview = get_redirect_preview(token)
-
-    html = _build_html(preview)
-
-    return func.HttpResponse(
-        html,
-        status_code=200,
-        mimetype="text/html",
-        headers={"Cache-Control": "public, max-age=60"},
-    )
