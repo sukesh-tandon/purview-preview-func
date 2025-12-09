@@ -1,17 +1,17 @@
 {
   "bindings": [
     {
+      "authLevel": "function",
       "type": "httpTrigger",
       "direction": "in",
       "name": "req",
-      "authLevel": "anonymous",
-      "methods": [ "get", "head", "options" ],
+      "methods": ["get"],
       "route": "purview-preview/{token}"
     },
     {
       "type": "http",
       "direction": "out",
-      "name": "$return"
+      "name": "res"
     }
   ]
 }
