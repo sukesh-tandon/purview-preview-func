@@ -2,8 +2,10 @@ import os
 import json
 from pathlib import Path
 from typing import Any, Dict
-from .models import RedirectPreview
-from .config import (
+
+# Correct imports based on your structure
+from shared.models import RedirectPreview
+from shared.config import (
     PUBLIC_BASE_URL,
     DEFAULT_OG_IMAGE_URL,
     DEFAULT_THEME_COLOR,
@@ -13,9 +15,12 @@ from .config import (
 # DIRECTORY SETUP
 #
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-PACKAGE_PREVIEWS_DIR = BASE_DIR / "redirect_previews"               # existing token-based JSON folder
-LENDER_DIR = BASE_DIR / "redirect_previews" / "lenders"             # NEW lender-based config folder
+# /home/site/wwwroot/shared/db_access.py → parents[2] = function root
+FUNCTION_ROOT = Path(__file__).resolve().parents[2]
+
+PACKAGE_PREVIEWS_DIR = FUNCTION_ROOT / "redirect_previews"
+LENDER_DIR = PACKAGE_PREVIEWS_DIR / "lenders"
+
 TMP_DIR = Path("/tmp/redirect-previews")
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -31,28 +36,25 @@ def _load_json(path: Path) -> Dict[str, Any]:
 
 def _hydrate_tmp_from_package(token: str) -> Path:
     """
-    Copies a packaged token.json → /tmp so Function cold starts
-    still work exactly like before.
+    Copy packaged token.json into /tmp so cold starts behave identically.
     """
-    src_json = PACKAGE_PREVIEWS_DIR / f"{token}.json"
-    dest_json = TMP_DIR / f"{token}.json"
+    src = PACKAGE_PREVIEWS_DIR / f"{token}.json"
+    dst = TMP_DIR / f"{token}.json"
 
-    if src_json.exists():
-        if not dest_json.exists():
+    if src.exists():
+        if not dst.exists():
             try:
-                dest_json.write_text(src_json.read_text(), encoding="utf-8")
+                dst.write_text(src.read_text(), encoding="utf-8")
             except Exception:
                 pass
-        return dest_json
+        return dst
 
-    return dest_json  # may not exist → caller handles fallback
+    return dst  # may not exist → caller checks .exists()
 
 
 def _default_preview(token: str) -> RedirectPreview:
-    """
-    Your existing fallback preview.
-    """
     target_url = f"{PUBLIC_BASE_URL.rstrip('/')}/p/{token}"
+
     return RedirectPreview(
         token=token,
         title="Your loan preview is ready",
@@ -64,98 +66,68 @@ def _default_preview(token: str) -> RedirectPreview:
     )
 
 
-def _normalize_lender(lender: str) -> str:
-    """
-    Normalization rule:
-    'Ram Fincorp' → 'ram_fincorp'
-    'Poonawalla STPL' → 'poonawalla_stpl'
-    'PayMe' → 'payme'
-    """
-    return lender.strip().lower().replace(" ", "_")
+def _normalize_lender(name: str) -> str:
+    return name.strip().lower().replace(" ", "_")
 
-
-#
-# 🚀 NEW: LENDER-BASED LOGIC (Option A)
-#
 
 def _load_lender_default(lender: str) -> Dict[str, Any] | None:
-    """
-    Loads <normalized>_default.json from redirect_previews/lenders/
-    e.g. PayMe → payme_default.json
-    """
     normalized = _normalize_lender(lender)
-    filename = f"{normalized}_default.json"
-    full_path = LENDER_DIR / filename
+    path = LENDER_DIR / f"{normalized}_default.json"
 
-    if full_path.exists():
+    if path.exists():
         try:
-            return _load_json(full_path)
+            return _load_json(path)
         except Exception:
-            return None
+            pass
 
     return None
 
 
 #
-# MAIN FUNCTION USED BY PURVIEW
+# MAIN FUNCTION
 #
 
-def get_redirect_preview(token: str | None) -> RedirectPreview:
+def get_redirect_preview(token: str | None) -> RedirectPreview | None:
     """
-    FINAL Version — SAFE — ZERO infra risk.
-
     Priority:
-    1) If <token>.json exists → use legacy behavior
-    2) If <token>.json contains 'lender' → use lender-based config file
-    3) Else fallback generic preview
+    1. token.json exists → hydrate it
+    2. token.json has lender → use lender defaults
+    3. no token.json → return None (404)
+    4. safe fallback only for valid token cases
     """
-
     if not token:
-        return _default_preview("")
+        return None
 
     token = token.strip()
     if not token:
-        return _default_preview("")
+        return None
 
-    #
-    # 1️⃣ Try legacy token-specific JSON
-    #
-    token_json_path = _hydrate_tmp_from_package(token)
+    # 1️⃣ Load legacy token.json
+    token_path = _hydrate_tmp_from_package(token)
     data = None
 
-    if token_json_path.exists():
+    if token_path.exists():
         try:
-            data = _load_json(token_json_path)
+            data = _load_json(token_path)
         except Exception:
             data = None
 
-    # If old-style JSON with no lender → return it exactly as before
+    # 1A → legacy format (no lender field)
     if data and "lender" not in data:
-        title = str(data.get("title") or "Your loan preview is ready")
-        description = str(data.get("description") or "Tap to view your personalised loan offer.")
-        target_url = str(data.get("target_url") or f"{PUBLIC_BASE_URL.rstrip('/')}/p/{token}")
-        image_url = str(data.get("image_url") or DEFAULT_OG_IMAGE_URL)
-        theme_color = str(data.get("theme_color") or DEFAULT_THEME_COLOR)
-        canonical_url = str(data.get("canonical_url") or target_url)
-
         return RedirectPreview(
             token=token,
-            title=title,
-            description=description,
-            target_url=target_url,
-            image_url=image_url,
-            theme_color=theme_color,
-            canonical_url=canonical_url,
+            title=str(data.get("title") or "Your loan preview is ready"),
+            description=str(data.get("description") or "Tap to view your personalised loan offer."),
+            target_url=str(data.get("target_url") or f"{PUBLIC_BASE_URL.rstrip('/')}/p/{token}"),
+            image_url=str(data.get("image_url") or DEFAULT_OG_IMAGE_URL),
+            theme_color=str(data.get("theme_color") or DEFAULT_THEME_COLOR),
+            canonical_url=str(data.get("canonical_url") or f"{PUBLIC_BASE_URL.rstrip('/')}/p/{token}"),
         )
 
-    #
-    # 2️⃣ If token.json contains lender → NEW lender-based config
-    #
+    # 2️⃣ lender → lender based defaults
     if data and "lender" in data:
         lender = str(data["lender"]).strip()
-        dest_url = str(
-            data.get("target_url") or f"{PUBLIC_BASE_URL.rstrip('/')}/p/{token}"
-        )
+        dest_url = str(data.get("target_url") or f"{PUBLIC_BASE_URL.rstrip('/')}/p/{token}")
 
         lender_cfg = _load_lender_default(lender)
 
@@ -170,7 +142,8 @@ def get_redirect_preview(token: str | None) -> RedirectPreview:
                 canonical_url=dest_url,
             )
 
-    #
-    # 3️⃣ Absolute fallback
-    #
-    return _default_preview(token)
+        # lender exists but no config → fallback
+        return _default_preview(token)
+
+    # 3️⃣ Completely missing token.json → return None (404)
+    return None
