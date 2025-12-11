@@ -1,12 +1,12 @@
 """
-shared/db_access.py — Purview V1 (DAB-first, no SQL, no requests)
-Production-stable version with:
- - Correct OData URL encoding (spaces → %20, quotes preserved)
- - Strict URL validation
- - Lender JSON TTL+LRU caching
- - Minimal retry backoff for DAB
- - Clean merging of static JSON + dynamic DB row
- - No external dependencies (works with minimal requirements.txt)
+shared/db_access.py — Purview V1 (Final Production-Stable Version)
+
+This version includes:
+ - Correct OData filter encoding (spaces → %20, quotes preserved)
+ - Correct absolute URL building using urljoin (fixes InvalidURL & 400)
+ - Retry-safe DAB fetch (no external deps)
+ - TTL + LRU lender JSON cache
+ - Clean fallback logic
 """
 
 import os
@@ -18,7 +18,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 from urllib import request, parse, error
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 import ssl
 
 from shared.models import RedirectPreview
@@ -29,7 +29,7 @@ from shared.config import (
 )
 
 # -----------------------------------------------------
-# CONFIG
+# CONFIGURATION
 # -----------------------------------------------------
 
 DAB_BASE_URL = os.getenv(
@@ -40,12 +40,12 @@ DAB_REDIRECTS_PATH = os.getenv("DAB_REDIRECTS_PATH", "redirects")
 
 DAB_TIMEOUT = float(os.getenv("DAB_TIMEOUT", "4"))
 DAB_RETRIES = int(os.getenv("DAB_RETRIES", "2"))
-DAB_BACKOFF = float(os.getenv("DAB_BACKOFF", "0.35"))
+DAB_BACKOFF = float(os.getenv("DAB_BACKOFF", "0.25"))
 
 LENDER_CACHE_TTL = int(os.getenv("LENDER_CACHE_TTL", "3600"))
 LENDER_CACHE_MAX = int(os.getenv("LENDER_CACHE_MAX", "128"))
 
-if not DAB_BASE_URL or not DAB_BASE_URL.startswith("http"):
+if not DAB_BASE_URL.startswith("http"):
     raise ValueError("INVALID DAB_BASE_URL")
 
 FUNCTION_ROOT = Path(__file__).resolve().parents[2]
@@ -61,26 +61,26 @@ class LruTtlCache:
         self.max_size = max_size
         self.ttl = ttl_sec
         self.lock = threading.RLock()
-        self.data: "OrderedDict[str, Tuple[Any, float]]" = OrderedDict()
+        self.store: "OrderedDict[str, Tuple[Any, float]]" = OrderedDict()
 
     def get(self, key: str):
         with self.lock:
-            if key not in self.data:
+            if key not in self.store:
                 return None
-            val, ts = self.data[key]
+            value, ts = self.store[key]
             if time.time() - ts > self.ttl:
-                del self.data[key]
+                del self.store[key]
                 return None
-            self.data.move_to_end(key)
-            return val
+            self.store.move_to_end(key)
+            return value
 
     def set(self, key: str, value: Any):
         with self.lock:
-            if key in self.data:
-                del self.data[key]
-            self.data[key] = (value, time.time())
-            while len(self.data) > self.max_size:
-                self.data.popitem(last=False)
+            if key in self.store:
+                del self.store[key]
+            self.store[key] = (value, time.time())
+            while len(self.store) > self.max_size:
+                self.store.popitem(last=False)
 
 
 _lender_cache = LruTtlCache(LENDER_CACHE_MAX, LENDER_CACHE_TTL)
@@ -95,9 +95,9 @@ def _is_valid_http_url(url: str) -> bool:
         return False
     try:
         p = urlparse(url)
-    except Exception:
+        return p.scheme in ("http", "https") and bool(p.netloc)
+    except:
         return False
-    return p.scheme in ("http", "https") and bool(p.netloc)
 
 
 def _normalize_lender(name: str) -> str:
@@ -119,34 +119,43 @@ def _load_lender_json(lender: str) -> Optional[Dict[str, Any]]:
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-        _lender_cache.set(norm, data)
-        return data
-    except Exception:
-        logging.exception("[Purview] Failed reading lender JSON: %s", path)
+            _lender_cache.set(norm, data)
+            return data
+    except:
+        logging.exception("[Purview] Failed loading lender JSON: %s", path)
         return None
 
 
 # -----------------------------------------------------
-# CORRECT ODATA URL BUILDER  (THIS FIXES YOUR PRODUCTION BUG)
+# CORRECT ODATA URL BUILDER  (THE FIX YOU NEEDED)
 # -----------------------------------------------------
 
 def _build_dab_url_for_token(token: str) -> str:
     """
-    urllib cannot accept spaces → must encode to %20.
-    DAB requires quotes to remain unencoded.
+    urllib CANNOT accept raw spaces. DAB REQUIRES quotes. Correct encoding:
+
+        raw: token eq 'PCAE7a'
+        encoded: token%20eq%20'PCAE7a'
+
+    Then we must always produce a FULL ABSOLUTE URL using urljoin.
     """
-    base = DAB_BASE_URL.rstrip("/")
-    path = DAB_REDIRECTS_PATH.strip("/")
 
-    raw = f"token eq '{token}'"
-    # Encode ONLY spaces → %20; preserve single quotes
-    encoded = raw.replace(" ", "%20")
+    raw_filter = f"token eq '{token}'"
 
-    return f"{base}/{path}?$filter={encoded}&$top=1"
+    # Encode only spaces → %20, keep quotes intact
+    encoded_filter = raw_filter.replace(" ", "%20")
+
+    # Construct the relative path (with no leading space/colon issues)
+    relative = f"/{DAB_REDIRECTS_PATH.strip('/')}?$filter={encoded_filter}&$top=1"
+
+    # Build ABSOLUTE URL safely
+    full_url = urljoin(DAB_BASE_URL.rstrip('/') + "/", relative)
+
+    return full_url
 
 
 # -----------------------------------------------------
-# DAB HTTP FETCH WITH RETRIES
+# DAB FETCH WITH RETRIES
 # -----------------------------------------------------
 
 def _http_get(url: str) -> Optional[str]:
@@ -159,12 +168,15 @@ def _http_get(url: str) -> Optional[str]:
         with request.urlopen(req, timeout=DAB_TIMEOUT, context=ctx) as resp:
             if 200 <= resp.status < 300:
                 return resp.read().decode("utf-8")
+
             if 400 <= resp.status < 500:
-                logging.warning("[Purview][DAB] Client error %d for %s", resp.status, url)
+                logging.warning("[Purview][DAB] HTTP %d for %s", resp.status, url)
                 return None
+
             logging.warning("[Purview][DAB] Server error %d for %s", resp.status, url)
+
     except Exception as ex:
-        logging.warning("[Purview][DAB] HTTP exception: %s", ex)
+        logging.warning("[Purview][DAB] Exception on GET: %s", ex)
 
     return None
 
@@ -174,8 +186,10 @@ def _http_get_with_retries(url: str) -> Optional[str]:
         body = _http_get(url)
         if body is not None:
             return body
+
         if attempt < DAB_RETRIES:
             time.sleep(DAB_BACKOFF * (2 ** attempt))
+
     return None
 
 
@@ -185,16 +199,16 @@ def _http_get_with_retries(url: str) -> Optional[str]:
 
 def _dab_lookup(token: str) -> Optional[Dict[str, Any]]:
     url = _build_dab_url_for_token(token)
-    body = _http_get_with_retries(url)
 
+    body = _http_get_with_retries(url)
     if not body:
-        logging.info("[Purview][DAB] Empty body for token=%s", token)
+        logging.info("[Purview][DAB] No response for token=%s", token)
         return None
 
     try:
         payload = json.loads(body)
     except:
-        logging.exception("[Purview][DAB] Invalid JSON for token=%s", token)
+        logging.exception("[Purview][DAB] Malformed JSON for token=%s", token)
         return None
 
     rows = payload.get("value") if isinstance(payload, dict) else payload
@@ -204,27 +218,26 @@ def _dab_lookup(token: str) -> Optional[Dict[str, Any]]:
 
     row = rows[0] if isinstance(rows, list) else rows
 
-    destination = (
+    dest = (
         row.get("destination_url")
         or row.get("dest_url")
         or row.get("destination")
         or row.get("url")
     )
-
     lender = row.get("lender")
     mobile = row.get("mobile") or row.get("msisdn")
     campaign_id = row.get("campaign_id") or row.get("campaign")
 
-    if not _is_valid_http_url(destination):
-        logging.warning("[Purview][DAB] Invalid destination_url for %s: %s", token, destination)
+    if not _is_valid_http_url(dest):
+        logging.warning("[Purview][DAB] Invalid dest_url for token=%s: %s", token, dest)
         return None
 
     if not lender:
-        logging.warning("[Purview][DAB] Missing lender for %s", token)
+        logging.warning("[Purview][DAB] Missing lender for token=%s", token)
         return None
 
     return {
-        "destination_url": destination,
+        "destination_url": dest,
         "lender": lender,
         "mobile": mobile,
         "campaign_id": campaign_id,
@@ -254,7 +267,7 @@ def get_redirect_preview(token: Optional[str]) -> Optional[RedirectPreview]:
     campaign_id = row.get("campaign_id")
 
     cfg = _load_lender_json(lender)
-    cached = cfg is not None
+    cached = bool(cfg)
 
     logging.info("PurviewHit token=%s lender=%s cached=%s", token, lender, cached)
 
@@ -273,8 +286,7 @@ def get_redirect_preview(token: Optional[str]) -> Optional[RedirectPreview]:
     return RedirectPreview(
         token=token,
         title=cfg.get("title") or f"Your {lender} loan preview is ready",
-        description=cfg.get("\
-description") or "",
+        description=cfg.get("description") or "",
         image_url=cfg.get("image_url") or DEFAULT_OG_IMAGE_URL,
         theme_color=cfg.get("theme_color") or DEFAULT_THEME_COLOR,
         target_url=destination,
