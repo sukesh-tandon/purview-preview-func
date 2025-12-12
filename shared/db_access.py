@@ -1,12 +1,13 @@
 """
-shared/db_access.py — Purview V1 (Final Production-Stable Version)
+shared/db_access.py — Purview V1 (Stable Production Version)
 
-This version includes:
- - Correct OData filter encoding (spaces → %20, quotes preserved)
- - Correct absolute URL building using urljoin (fixes InvalidURL & 400)
- - Retry-safe DAB fetch (no external deps)
- - TTL + LRU lender JSON cache
- - Clean fallback logic
+Includes:
+ - CORRECT absolute URL building for DAB (fixing HTTP 400)
+ - CORRECT OData filter encoding (spaces → %20, quotes preserved)
+ - Full URL logging (to see exactly what DAB receives)
+ - 400-body logging (to see DAB’s actual error)
+ - Lender JSON caching
+ - No external dependencies
 """
 
 import os
@@ -29,7 +30,7 @@ from shared.config import (
 )
 
 # -----------------------------------------------------
-# CONFIGURATION
+# CONFIG
 # -----------------------------------------------------
 
 DAB_BASE_URL = os.getenv(
@@ -45,12 +46,8 @@ DAB_BACKOFF = float(os.getenv("DAB_BACKOFF", "0.25"))
 LENDER_CACHE_TTL = int(os.getenv("LENDER_CACHE_TTL", "3600"))
 LENDER_CACHE_MAX = int(os.getenv("LENDER_CACHE_MAX", "128"))
 
-if not DAB_BASE_URL.startswith("http"):
-    raise ValueError("INVALID DAB_BASE_URL")
-
 FUNCTION_ROOT = Path(__file__).resolve().parents[2]
 LENDER_JSON_DIR = FUNCTION_ROOT / "redirect_previews" / "lenders"
-
 
 # -----------------------------------------------------
 # TTL + LRU CACHE
@@ -67,12 +64,12 @@ class LruTtlCache:
         with self.lock:
             if key not in self.store:
                 return None
-            value, ts = self.store[key]
+            val, ts = self.store[key]
             if time.time() - ts > self.ttl:
                 del self.store[key]
                 return None
             self.store.move_to_end(key)
-            return value
+            return val
 
     def set(self, key: str, value: Any):
         with self.lock:
@@ -85,14 +82,11 @@ class LruTtlCache:
 
 _lender_cache = LruTtlCache(LENDER_CACHE_MAX, LENDER_CACHE_TTL)
 
-
 # -----------------------------------------------------
 # HELPERS
 # -----------------------------------------------------
 
 def _is_valid_http_url(url: str) -> bool:
-    if not url:
-        return False
     try:
         p = urlparse(url)
         return p.scheme in ("http", "https") and bool(p.netloc)
@@ -121,41 +115,42 @@ def _load_lender_json(lender: str) -> Optional[Dict[str, Any]]:
             data = json.load(fh)
             _lender_cache.set(norm, data)
             return data
-    except:
-        logging.exception("[Purview] Failed loading lender JSON: %s", path)
+    except Exception:
+        logging.exception("[Purview] Failed to read lender JSON: %s", path)
         return None
 
 
 # -----------------------------------------------------
-# CORRECT ODATA URL BUILDER  (THE FIX YOU NEEDED)
+# CORRECT ODATA URL BUILDER (ABSOLUTE URL + PROPER ENCODING)
 # -----------------------------------------------------
 
 def _build_dab_url_for_token(token: str) -> str:
     """
-    urllib CANNOT accept raw spaces. DAB REQUIRES quotes. Correct encoding:
-
-        raw: token eq 'PCAE7a'
-        encoded: token%20eq%20'PCAE7a'
-
-    Then we must always produce a FULL ABSOLUTE URL using urljoin.
+    MUST:
+      - Encode spaces (%20)
+      - Preserve single quotes
+      - Build a FULL ABSOLUTE URL using urljoin (fixes HTTP 400)
     """
 
     raw_filter = f"token eq '{token}'"
 
-    # Encode only spaces → %20, keep quotes intact
+    # Encode only spaces
     encoded_filter = raw_filter.replace(" ", "%20")
 
-    # Construct the relative path (with no leading space/colon issues)
-    relative = f"/{DAB_REDIRECTS_PATH.strip('/')}?$filter={encoded_filter}&$top=1"
+    # /redirects?$filter=token%20eq%20'PCAE7a'&$top=1
+    relative_path = (
+        f"/{DAB_REDIRECTS_PATH.strip('/')}"
+        f"?$filter={encoded_filter}&$top=1"
+    )
 
-    # Build ABSOLUTE URL safely
-    full_url = urljoin(DAB_BASE_URL.rstrip('/') + "/", relative)
+    # Build ABSOLUTE URL
+    absolute = urljoin(DAB_BASE_URL.rstrip('/') + "/", relative_path)
 
-    return full_url
+    return absolute
 
 
 # -----------------------------------------------------
-# DAB FETCH WITH RETRIES
+# HTTP GET WITH RETRIES & FULL ERROR BODY LOGGING
 # -----------------------------------------------------
 
 def _http_get(url: str) -> Optional[str]:
@@ -170,13 +165,25 @@ def _http_get(url: str) -> Optional[str]:
                 return resp.read().decode("utf-8")
 
             if 400 <= resp.status < 500:
-                logging.warning("[Purview][DAB] HTTP %d for %s", resp.status, url)
+                body = resp.read().decode("utf-8", errors="ignore")
+                logging.warning("[Purview][DAB] HTTP %d body=%s", resp.status, body)
                 return None
 
-            logging.warning("[Purview][DAB] Server error %d for %s", resp.status, url)
+            logging.warning("[Purview][DAB] HTTP %d (server)", resp.status)
+
+    except error.HTTPError as he:
+        body = ""
+        try:
+            if he.fp:
+                body = he.fp.read().decode("utf-8", errors="ignore")
+        except:
+            pass
+        logging.warning("[Purview][DAB] HTTPError %s body=%s", he.code, body)
+        return None
 
     except Exception as ex:
-        logging.warning("[Purview][DAB] Exception on GET: %s", ex)
+        logging.warning("[Purview][DAB] Exception: %s", ex)
+        return None
 
     return None
 
@@ -186,10 +193,8 @@ def _http_get_with_retries(url: str) -> Optional[str]:
         body = _http_get(url)
         if body is not None:
             return body
-
         if attempt < DAB_RETRIES:
             time.sleep(DAB_BACKOFF * (2 ** attempt))
-
     return None
 
 
@@ -200,6 +205,9 @@ def _http_get_with_retries(url: str) -> Optional[str]:
 def _dab_lookup(token: str) -> Optional[Dict[str, Any]]:
     url = _build_dab_url_for_token(token)
 
+    # 🔥 LOG THE EXACT URL BEING SENT TO DAB
+    logging.error("[Purview][DAB] GET %s", url)
+
     body = _http_get_with_retries(url)
     if not body:
         logging.info("[Purview][DAB] No response for token=%s", token)
@@ -208,12 +216,12 @@ def _dab_lookup(token: str) -> Optional[Dict[str, Any]]:
     try:
         payload = json.loads(body)
     except:
-        logging.exception("[Purview][DAB] Malformed JSON for token=%s", token)
+        logging.exception("[Purview][DAB] Bad JSON for token=%s", token)
         return None
 
     rows = payload.get("value") if isinstance(payload, dict) else payload
     if not rows:
-        logging.info("[Purview][DAB] No row for token=%s", token)
+        logging.info("[Purview][DAB] Empty result for %s", token)
         return None
 
     row = rows[0] if isinstance(rows, list) else rows
@@ -229,7 +237,7 @@ def _dab_lookup(token: str) -> Optional[Dict[str, Any]]:
     campaign_id = row.get("campaign_id") or row.get("campaign")
 
     if not _is_valid_http_url(dest):
-        logging.warning("[Purview][DAB] Invalid dest_url for token=%s: %s", token, dest)
+        logging.warning("[Purview][DAB] Invalid dest_url for %s: %s", token, dest)
         return None
 
     if not lender:
@@ -245,7 +253,7 @@ def _dab_lookup(token: str) -> Optional[Dict[str, Any]]:
 
 
 # -----------------------------------------------------
-# PUBLIC API FOR __init__.py
+# PUBLIC ENTRYPOINT
 # -----------------------------------------------------
 
 def get_redirect_preview(token: Optional[str]) -> Optional[RedirectPreview]:
@@ -261,7 +269,7 @@ def get_redirect_preview(token: Optional[str]) -> Optional[RedirectPreview]:
         logging.info("[Purview] No DAB row for token=%s", token)
         return None
 
-    destination = row["destination_url"]
+    dest = row["destination_url"]
     lender = row["lender"]
     mobile = row.get("mobile")
     campaign_id = row.get("campaign_id")
@@ -278,8 +286,8 @@ def get_redirect_preview(token: Optional[str]) -> Optional[RedirectPreview]:
             description="Tap to view your personalised loan offer.",
             image_url=DEFAULT_OG_IMAGE_URL,
             theme_color=DEFAULT_THEME_COLOR,
-            target_url=destination,
-            canonical_url=destination,
+            target_url=dest,
+            canonical_url=dest,
             meta={"lender": lender, "mobile": mobile, "campaign_id": campaign_id, "fallback": True},
         )
 
@@ -289,7 +297,7 @@ def get_redirect_preview(token: Optional[str]) -> Optional[RedirectPreview]:
         description=cfg.get("description") or "",
         image_url=cfg.get("image_url") or DEFAULT_OG_IMAGE_URL,
         theme_color=cfg.get("theme_color") or DEFAULT_THEME_COLOR,
-        target_url=destination,
-        canonical_url=destination,
+        target_url=dest,
+        canonical_url=dest,
         meta={"lender": lender, "mobile": mobile, "campaign_id": campaign_id},
     )
