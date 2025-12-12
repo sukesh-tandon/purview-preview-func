@@ -1,13 +1,14 @@
 """
-shared/db_access.py — Purview V1 (FINAL STABLE VERSION)
+shared/db_access.py — Purview V1 (FINAL PRODUCTION-STABLE VERSION)
 
-This version:
- - Uses correct absolute URL construction (urljoin without leading slash)
- - Uses correct OData filter encoding (spaces → %20, quotes preserved)
- - Reads /api prefix from DAB_BASE_URL (you MUST set env correctly)
- - Logs full URL before DAB call
- - Logs full 400 body from DAB
- - No pyodbc, no SQL direct calls
+This version includes:
+ - Correct absolute URL building (preserves /api)
+ - Correct OData filter encoding (spaces → %20, quotes preserved)
+ - Removes $top (your DAB rejects it)
+ - Full URL logging before request
+ - Full body logging for HTTP 400 from DAB
+ - Lender JSON caching
+ - Zero SQL, zero pyodbc
 """
 
 import os
@@ -16,11 +17,11 @@ import logging
 import time
 import ssl
 import threading
+from urllib import request, error
+from urllib.parse import urlparse, urljoin
 from pathlib import Path
 from collections import OrderedDict
-from typing import Optional, Dict, Any, Tuple
-from urllib import request, parse, error
-from urllib.parse import urlparse, urljoin
+from typing import Optional, Dict, Any
 
 from shared.models import RedirectPreview
 from shared.config import DEFAULT_OG_IMAGE_URL, DEFAULT_THEME_COLOR
@@ -33,7 +34,8 @@ DAB_BASE_URL = os.getenv(
     "DAB_BASE_URL",
     "https://duit-dab-api.mangobay-e9dc6af5.centralindia.azurecontainerapps.io/api"
 )
-DAB_REDIRECTS_PATH = os.getenv("DAB_REDIRECTS_PATH", "redirects")  # MUST be 'redirects'
+
+DAB_REDIRECTS_PATH = os.getenv("DAB_REDIRECTS_PATH", "redirects")
 
 DAB_TIMEOUT = float(os.getenv("DAB_TIMEOUT", "4"))
 DAB_RETRIES = int(os.getenv("DAB_RETRIES", "2"))
@@ -75,16 +77,11 @@ class LruTtlCache:
             while len(self.store) > self.max_size:
                 self.store.popitem(last=False)
 
-
 _lender_cache = LruTtlCache(LENDER_CACHE_MAX, LENDER_CACHE_TTL)
 
 # -----------------------------------------------------
 # HELPERS
 # -----------------------------------------------------
-
-def _normalize_lender(name: str) -> str:
-    return name.lower().strip().replace(" ", "_")
-
 
 def _is_valid_http_url(url: str) -> bool:
     try:
@@ -93,6 +90,8 @@ def _is_valid_http_url(url: str) -> bool:
     except:
         return False
 
+def _normalize_lender(name: str) -> str:
+    return name.strip().lower().replace(" ", "_")
 
 def _load_lender_json(lender: str) -> Optional[Dict[str, Any]]:
     norm = _normalize_lender(lender)
@@ -103,7 +102,7 @@ def _load_lender_json(lender: str) -> Optional[Dict[str, Any]]:
 
     path = LENDER_JSON_DIR / f"{norm}_default.json"
     if not path.exists():
-        logging.warning("[Purview] No lender JSON for: %s", lender)
+        logging.warning("[Purview] Missing lender JSON: %s", path)
         return None
 
     try:
@@ -112,42 +111,38 @@ def _load_lender_json(lender: str) -> Optional[Dict[str, Any]]:
             _lender_cache.set(norm, data)
             return data
     except:
-        logging.exception("[Purview] Failed reading lender JSON for %s", lender)
+        logging.exception("[Purview] Failed loading lender json: %s", path)
         return None
 
-
 # -----------------------------------------------------
-# CORRECT DAB URL BUILDER (critical fix)
+# CORRECT DAB URL BUILDER (NO $top)
 # -----------------------------------------------------
 
 def _build_dab_url_for_token(token: str) -> str:
     """
-    IMPORTANT:
-    - DAB_BASE_URL MUST include /api (set via env)
-    - DAB_REDIRECTS_PATH MUST be 'redirects'
-    - DO NOT put a leading slash in the relative path,
-      or urljoin will delete /api from the base.
+    FINAL WORKING VERSION:
+      - DAB_BASE_URL must include /api
+      - DO NOT start relative path with "/" → urljoin would drop /api
+      - DAB does NOT support $top → remove it
+      - Encode spaces as %20, preserve quotes
     """
 
     raw_filter = f"token eq '{token}'"
-
-    # Encode only spaces → %20 (single quotes preserved)
     encoded_filter = raw_filter.replace(" ", "%20")
 
-    # DO NOT start with "/" — this was the root bug
-    relative = f"{DAB_REDIRECTS_PATH.strip('/')}?$filter={encoded_filter}&$top=1"
+    # NO leading slash, NO $top
+    relative = f"{DAB_REDIRECTS_PATH.strip('/')}?$filter={encoded_filter}"
 
-    # urljoin preserves /api now
-    absolute = urljoin(DAB_BASE_URL.rstrip('/') + "/", relative)
-    return absolute
-
+    # urljoin preserves /api when relative has no leading slash
+    return urljoin(DAB_BASE_URL.rstrip('/') + "/", relative)
 
 # -----------------------------------------------------
-# HTTP GET + LOG FULL 400 BODY
+# HTTP GET + RETRIES + BODY LOGGING
 # -----------------------------------------------------
 
 def _http_get(url: str) -> Optional[str]:
     ctx = ssl.create_default_context()
+
     req = request.Request(url, method="GET")
     req.add_header("Accept", "application/json")
     req.add_header("User-Agent", "duit-purview-v1")
@@ -157,6 +152,7 @@ def _http_get(url: str) -> Optional[str]:
             if resp.status == 200:
                 return resp.read().decode("utf-8")
 
+            # Log body for >= 400
             body = resp.read().decode("utf-8", errors="ignore")
             logging.warning("[Purview][DAB] HTTP %d body=%s", resp.status, body)
             return None
@@ -168,13 +164,12 @@ def _http_get(url: str) -> Optional[str]:
                 body = he.fp.read().decode("utf-8", errors="ignore")
         except:
             pass
-        logging.warning("[Purview][DAB] HTTPError %s body=%s", getattr(he, "code", ""), body)
+        logging.warning("[Purview][DAB] HTTPError %s body=%s", he.code, body)
         return None
 
     except Exception as ex:
         logging.warning("[Purview][DAB] Exception: %s", ex)
         return None
-
 
 def _http_get_with_retries(url: str) -> Optional[str]:
     for attempt in range(DAB_RETRIES + 1):
@@ -185,7 +180,6 @@ def _http_get_with_retries(url: str) -> Optional[str]:
             time.sleep(DAB_BACKOFF * (2 ** attempt))
     return None
 
-
 # -----------------------------------------------------
 # DAB LOOKUP
 # -----------------------------------------------------
@@ -193,7 +187,7 @@ def _http_get_with_retries(url: str) -> Optional[str]:
 def _dab_lookup(token: str) -> Optional[Dict[str, Any]]:
     url = _build_dab_url_for_token(token)
 
-    # FULL URL LOG (critical)
+    # CRITICAL: Log the exact URL
     logging.error("[Purview][DAB] GET %s", url)
 
     body = _http_get_with_retries(url)
@@ -203,13 +197,13 @@ def _dab_lookup(token: str) -> Optional[Dict[str, Any]]:
 
     try:
         payload = json.loads(body)
-    except Exception:
+    except:
         logging.exception("[Purview][DAB] Invalid JSON for token=%s", token)
         return None
 
     rows = payload.get("value")
     if not rows:
-        logging.info("[Purview][DAB] No rows for token=%s", token)
+        logging.info("[Purview][DAB] No rows for %s", token)
         return None
 
     row = rows[0]
@@ -220,7 +214,11 @@ def _dab_lookup(token: str) -> Optional[Dict[str, Any]]:
     campaign_id = row.get("campaign_id")
 
     if not _is_valid_http_url(dest):
-        logging.warning("[Purview][DAB] Invalid dest_url: %s", dest)
+        logging.warning("[Purview][DAB] Invalid destination_url for %s: %s", token, dest)
+        return None
+
+    if not lender:
+        logging.warning("[Purview][DAB] Missing lender for %s", token)
         return None
 
     return {
@@ -229,7 +227,6 @@ def _dab_lookup(token: str) -> Optional[Dict[str, Any]]:
         "mobile": mobile,
         "campaign_id": campaign_id,
     }
-
 
 # -----------------------------------------------------
 # PUBLIC ENTRYPOINT
@@ -247,8 +244,8 @@ def get_redirect_preview(token: Optional[str]) -> Optional[RedirectPreview]:
     if not row:
         return None
 
-    lender = row["lender"]
     dest = row["destination_url"]
+    lender = row["lender"]
     mobile = row.get("mobile")
     campaign_id = row.get("campaign_id")
 
