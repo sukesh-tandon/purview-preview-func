@@ -1,43 +1,39 @@
 """
-shared/db_access.py — Purview V1 (Stable Production Version)
+shared/db_access.py — Purview V1 (FINAL STABLE VERSION)
 
-Includes:
- - CORRECT absolute URL building for DAB (fixing HTTP 400)
- - CORRECT OData filter encoding (spaces → %20, quotes preserved)
- - Full URL logging (to see exactly what DAB receives)
- - 400-body logging (to see DAB’s actual error)
- - Lender JSON caching
- - No external dependencies
+This version:
+ - Uses correct absolute URL construction (urljoin without leading slash)
+ - Uses correct OData filter encoding (spaces → %20, quotes preserved)
+ - Reads /api prefix from DAB_BASE_URL (you MUST set env correctly)
+ - Logs full URL before DAB call
+ - Logs full 400 body from DAB
+ - No pyodbc, no SQL direct calls
 """
 
 import os
 import json
 import logging
 import time
+import ssl
 import threading
-from collections import OrderedDict
 from pathlib import Path
+from collections import OrderedDict
 from typing import Optional, Dict, Any, Tuple
 from urllib import request, parse, error
 from urllib.parse import urlparse, urljoin
-import ssl
 
 from shared.models import RedirectPreview
-from shared.config import (
-    PUBLIC_BASE_URL,
-    DEFAULT_OG_IMAGE_URL,
-    DEFAULT_THEME_COLOR,
-)
+from shared.config import DEFAULT_OG_IMAGE_URL, DEFAULT_THEME_COLOR
 
 # -----------------------------------------------------
-# CONFIG
+# ENV CONFIG
 # -----------------------------------------------------
 
 DAB_BASE_URL = os.getenv(
     "DAB_BASE_URL",
-    "https://duit-dab-api.mangobay-e9dc6af5.centralindia.azurecontainerapps.io/api",
+    "https://duit-dab-api.mangobay-e9dc6af5.centralindia.azurecontainerapps.io/api"
 )
-DAB_REDIRECTS_PATH = os.getenv("DAB_REDIRECTS_PATH", "redirects")
+DAB_REDIRECTS_PATH = os.getenv("DAB_REDIRECTS_PATH", "redirects")  # MUST be 'redirects'
 
 DAB_TIMEOUT = float(os.getenv("DAB_TIMEOUT", "4"))
 DAB_RETRIES = int(os.getenv("DAB_RETRIES", "2"))
@@ -54,13 +50,13 @@ LENDER_JSON_DIR = FUNCTION_ROOT / "redirect_previews" / "lenders"
 # -----------------------------------------------------
 
 class LruTtlCache:
-    def __init__(self, max_size: int, ttl_sec: int):
+    def __init__(self, max_size, ttl):
         self.max_size = max_size
-        self.ttl = ttl_sec
+        self.ttl = ttl
         self.lock = threading.RLock()
-        self.store: "OrderedDict[str, Tuple[Any, float]]" = OrderedDict()
+        self.store = OrderedDict()
 
-    def get(self, key: str):
+    def get(self, key):
         with self.lock:
             if key not in self.store:
                 return None
@@ -71,7 +67,7 @@ class LruTtlCache:
             self.store.move_to_end(key)
             return val
 
-    def set(self, key: str, value: Any):
+    def set(self, key, value):
         with self.lock:
             if key in self.store:
                 del self.store[key]
@@ -86,16 +82,16 @@ _lender_cache = LruTtlCache(LENDER_CACHE_MAX, LENDER_CACHE_TTL)
 # HELPERS
 # -----------------------------------------------------
 
+def _normalize_lender(name: str) -> str:
+    return name.lower().strip().replace(" ", "_")
+
+
 def _is_valid_http_url(url: str) -> bool:
     try:
         p = urlparse(url)
         return p.scheme in ("http", "https") and bool(p.netloc)
     except:
         return False
-
-
-def _normalize_lender(name: str) -> str:
-    return name.strip().lower().replace(" ", "_")
 
 
 def _load_lender_json(lender: str) -> Optional[Dict[str, Any]]:
@@ -107,50 +103,47 @@ def _load_lender_json(lender: str) -> Optional[Dict[str, Any]]:
 
     path = LENDER_JSON_DIR / f"{norm}_default.json"
     if not path.exists():
-        logging.warning("[Purview] Missing lender JSON: %s", path)
+        logging.warning("[Purview] No lender JSON for: %s", lender)
         return None
 
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
             _lender_cache.set(norm, data)
             return data
-    except Exception:
-        logging.exception("[Purview] Failed to read lender JSON: %s", path)
+    except:
+        logging.exception("[Purview] Failed reading lender JSON for %s", lender)
         return None
 
 
 # -----------------------------------------------------
-# CORRECT ODATA URL BUILDER (ABSOLUTE URL + PROPER ENCODING)
+# CORRECT DAB URL BUILDER (critical fix)
 # -----------------------------------------------------
 
 def _build_dab_url_for_token(token: str) -> str:
     """
-    MUST:
-      - Encode spaces (%20)
-      - Preserve single quotes
-      - Build a FULL ABSOLUTE URL using urljoin (fixes HTTP 400)
+    IMPORTANT:
+    - DAB_BASE_URL MUST include /api (set via env)
+    - DAB_REDIRECTS_PATH MUST be 'redirects'
+    - DO NOT put a leading slash in the relative path,
+      or urljoin will delete /api from the base.
     """
 
     raw_filter = f"token eq '{token}'"
 
-    # Encode only spaces
+    # Encode only spaces → %20 (single quotes preserved)
     encoded_filter = raw_filter.replace(" ", "%20")
 
-    # /redirects?$filter=token%20eq%20'PCAE7a'&$top=1
-    relative_path = (
-        f"/{DAB_REDIRECTS_PATH.strip('/')}"
-        f"?$filter={encoded_filter}&$top=1"
-    )
+    # DO NOT start with "/" — this was the root bug
+    relative = f"{DAB_REDIRECTS_PATH.strip('/')}?$filter={encoded_filter}&$top=1"
 
-    # Build ABSOLUTE URL
-    absolute = urljoin(DAB_BASE_URL.rstrip('/') + "/", relative_path)
-
+    # urljoin preserves /api now
+    absolute = urljoin(DAB_BASE_URL.rstrip('/') + "/", relative)
     return absolute
 
 
 # -----------------------------------------------------
-# HTTP GET WITH RETRIES & FULL ERROR BODY LOGGING
+# HTTP GET + LOG FULL 400 BODY
 # -----------------------------------------------------
 
 def _http_get(url: str) -> Optional[str]:
@@ -161,15 +154,12 @@ def _http_get(url: str) -> Optional[str]:
 
     try:
         with request.urlopen(req, timeout=DAB_TIMEOUT, context=ctx) as resp:
-            if 200 <= resp.status < 300:
+            if resp.status == 200:
                 return resp.read().decode("utf-8")
 
-            if 400 <= resp.status < 500:
-                body = resp.read().decode("utf-8", errors="ignore")
-                logging.warning("[Purview][DAB] HTTP %d body=%s", resp.status, body)
-                return None
-
-            logging.warning("[Purview][DAB] HTTP %d (server)", resp.status)
+            body = resp.read().decode("utf-8", errors="ignore")
+            logging.warning("[Purview][DAB] HTTP %d body=%s", resp.status, body)
+            return None
 
     except error.HTTPError as he:
         body = ""
@@ -178,14 +168,12 @@ def _http_get(url: str) -> Optional[str]:
                 body = he.fp.read().decode("utf-8", errors="ignore")
         except:
             pass
-        logging.warning("[Purview][DAB] HTTPError %s body=%s", he.code, body)
+        logging.warning("[Purview][DAB] HTTPError %s body=%s", getattr(he, "code", ""), body)
         return None
 
     except Exception as ex:
         logging.warning("[Purview][DAB] Exception: %s", ex)
         return None
-
-    return None
 
 
 def _http_get_with_retries(url: str) -> Optional[str]:
@@ -205,7 +193,7 @@ def _http_get_with_retries(url: str) -> Optional[str]:
 def _dab_lookup(token: str) -> Optional[Dict[str, Any]]:
     url = _build_dab_url_for_token(token)
 
-    # 🔥 LOG THE EXACT URL BEING SENT TO DAB
+    # FULL URL LOG (critical)
     logging.error("[Purview][DAB] GET %s", url)
 
     body = _http_get_with_retries(url)
@@ -215,33 +203,24 @@ def _dab_lookup(token: str) -> Optional[Dict[str, Any]]:
 
     try:
         payload = json.loads(body)
-    except:
-        logging.exception("[Purview][DAB] Bad JSON for token=%s", token)
+    except Exception:
+        logging.exception("[Purview][DAB] Invalid JSON for token=%s", token)
         return None
 
-    rows = payload.get("value") if isinstance(payload, dict) else payload
+    rows = payload.get("value")
     if not rows:
-        logging.info("[Purview][DAB] Empty result for %s", token)
+        logging.info("[Purview][DAB] No rows for token=%s", token)
         return None
 
-    row = rows[0] if isinstance(rows, list) else rows
+    row = rows[0]
 
-    dest = (
-        row.get("destination_url")
-        or row.get("dest_url")
-        or row.get("destination")
-        or row.get("url")
-    )
+    dest = row.get("destination_url")
     lender = row.get("lender")
-    mobile = row.get("mobile") or row.get("msisdn")
-    campaign_id = row.get("campaign_id") or row.get("campaign")
+    mobile = row.get("mobile")
+    campaign_id = row.get("campaign_id")
 
     if not _is_valid_http_url(dest):
-        logging.warning("[Purview][DAB] Invalid dest_url for %s: %s", token, dest)
-        return None
-
-    if not lender:
-        logging.warning("[Purview][DAB] Missing lender for token=%s", token)
+        logging.warning("[Purview][DAB] Invalid dest_url: %s", dest)
         return None
 
     return {
@@ -266,11 +245,10 @@ def get_redirect_preview(token: Optional[str]) -> Optional[RedirectPreview]:
 
     row = _dab_lookup(token)
     if not row:
-        logging.info("[Purview] No DAB row for token=%s", token)
         return None
 
-    dest = row["destination_url"]
     lender = row["lender"]
+    dest = row["destination_url"]
     mobile = row.get("mobile")
     campaign_id = row.get("campaign_id")
 
@@ -293,10 +271,10 @@ def get_redirect_preview(token: Optional[str]) -> Optional[RedirectPreview]:
 
     return RedirectPreview(
         token=token,
-        title=cfg.get("title") or f"Your {lender} loan preview is ready",
-        description=cfg.get("description") or "",
-        image_url=cfg.get("image_url") or DEFAULT_OG_IMAGE_URL,
-        theme_color=cfg.get("theme_color") or DEFAULT_THEME_COLOR,
+        title=cfg.get("title", f"Your {lender} loan preview is ready"),
+        description=cfg.get("description", ""),
+        image_url=cfg.get("image_url", DEFAULT_OG_IMAGE_URL),
+        theme_color=cfg.get("theme_color", DEFAULT_THEME_COLOR),
         target_url=dest,
         canonical_url=dest,
         meta={"lender": lender, "mobile": mobile, "campaign_id": campaign_id},
