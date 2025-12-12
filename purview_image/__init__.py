@@ -1,196 +1,130 @@
-# purview_preview/__init__.py
+# purview_preview/purview_image.py
 import logging
+import os
+import mimetypes
+from urllib.parse import urlparse, unquote
+
 import azure.functions as func
 
 from shared.db_access import get_redirect_preview
-from urllib.parse import quote_plus
+from typing import Optional
+
+# Try to import DefaultAzureCredential if available (managed identity)
+try:
+    from azure.identity import DefaultAzureCredential  # optional
+    _HAS_AZURE_IDENTITY = True
+except Exception:
+    _HAS_AZURE_IDENTITY = False
+
+from azure.storage.blob import BlobClient, ContainerClient, BlobServiceClient  # azure-storage-blob must be installed
+
+
+def _parse_blob_url(url: str):
+    """
+    Parse a blob url like:
+    https://<account>.blob.core.windows.net/<container>/<path/to/blob.jpg>
+    Returns (account_url, container_name, blob_path)
+    """
+    p = urlparse(url)
+    # p.netloc => <account>.blob.core.windows.net
+    account_url = f"{p.scheme}://{p.netloc}"
+    # path starts with '/'
+    path = p.path.lstrip("/")
+    parts = path.split("/", 1)
+    if len(parts) == 1:
+        container = parts[0]
+        blob_path = ""
+    else:
+        container, blob_path = parts[0], parts[1]
+    # decode URL-encoded parts
+    return account_url, container, unquote(blob_path)
+
+
+def _get_blob_client_from_url(blob_url: str) -> Optional[BlobClient]:
+    """
+    Create a BlobClient for a given blob_url using:
+      1) DefaultAzureCredential (managed identity) if available, else
+      2) STORAGE_CONNECTION_STRING env fallback
+    """
+    account_url, container, blob_path = _parse_blob_url(blob_url)
+    # If DefaultAzureCredential is available in runtime and managed identity is enabled, prefer it.
+    if _HAS_AZURE_IDENTITY:
+        try:
+            cred = DefaultAzureCredential()
+            # BlobClient.from_blob_url accepts credential
+            return BlobClient.from_blob_url(blob_url, credential=cred)
+        except Exception as ex:
+            logging.warning("[Image] DefaultAzureCredential failing: %s", ex)
+
+    # Fallback: connection string
+    conn = os.getenv("STORAGE_CONNECTION_STRING")
+    if conn:
+        try:
+            # Build client from connection string
+            service = BlobServiceClient.from_connection_string(conn)
+            container_client = service.get_container_client(container)
+            return container_client.get_blob_client(blob_path)
+        except Exception as ex:
+            logging.exception("[Image] Failed to create BlobClient from connection string: %s", ex)
+
+    logging.error("[Image] No available credential to access blob. Set managed identity or STORAGE_CONNECTION_STRING.")
+    return None
+
+
+def _guess_content_type(name: str) -> str:
+    ctype, _ = mimetypes.guess_type(name)
+    return ctype or "application/octet-stream"
+
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
     """
-    Azure Function entry point.
-    Route: purview-preview/{token}
+    Route: /api/purview-image/{token}
+    Returns binary image bytes with correct Content-Type.
     """
     try:
-        logging.info("PURVIEW-V1 request received")
-
         route_params = getattr(req, "route_params", {}) or {}
-        token = (
-            route_params.get("token")
-            or req.params.get("token")
-            or req.params.get("t")
-        )
-
-        # Health probes / always-on
-        if token in (None, "", "health", "favicon.ico", "warmup", "ready"):
-            return func.HttpResponse(status_code=204)
+        token = route_params.get("token") or req.params.get("token") or req.params.get("t")
 
         if not token:
-            logging.warning("No token provided in route or query.")
-            return func.HttpResponse(
-                "Invalid link: token missing",
-                status_code=400,
-                mimetype="text/plain",
-            )
+            return func.HttpResponse("token missing", status_code=400)
 
+        # Use existing logic to resolve token -> RedirectPreview (and therefore image_url)
         preview = get_redirect_preview(token)
-
         if not preview:
-            logging.warning(f"No preview found for token: {token}")
-            return func.HttpResponse(
-                "Preview not found. Token may be expired.",
-                status_code=404,
-                mimetype="text/plain",
-            )
+            return func.HttpResponse("Not found", status_code=404)
 
-        html = _build_html(preview, token)
-        return func.HttpResponse(
-            html,
-            status_code=200,
-            mimetype="text/html",
-            headers={"Cache-Control": "public, max-age=60"},
-        )
+        # Expect preview.image_url to be the canonical blob URL (as your JSON contains).
+        blob_url = getattr(preview, "image_url", None)
+        if not blob_url:
+            # fallback: try reading from lender JSON again (db_access should do this but safety)
+            logging.warning("[Image] preview has no image_url for token=%s", token)
+            return func.HttpResponse("No image", status_code=404)
 
-    except Exception as exc:
-        logging.exception("PURVIEW-V1: unhandled exception")
-        return func.HttpResponse(
-            "Preview service temporarily unavailable.",
-            status_code=500,
-            mimetype="text/plain",
-        )
+        # Create blob client
+        blob_client = _get_blob_client_from_url(blob_url)
+        if not blob_client:
+            return func.HttpResponse("Image unavailable (auth)", status_code=503)
 
+        # Download blob
+        try:
+            downloader = blob_client.download_blob()
+            data = downloader.readall()
+        except Exception as ex:
+            logging.exception("[Image] Failed download for %s", blob_url)
+            return func.HttpResponse("Image not found", status_code=404)
 
-def _build_html(preview, token) -> str:
-    """
-    Builds the on-screen Purview page + OG tags.
-    Uses internal token-based image endpoint for og:image.
-    """
+        # Determine content-type from blob name / url
+        _, _, blob_path = _parse_blob_url(blob_url)
+        content_type = _guess_content_type(blob_path)
 
-    title = preview.title or ""
-    description = preview.description or ""
-    # OG image now points to our internal endpoint which serves the blob
-    # we url-quote token so it is safe in path
-    image_endpoint = f"/api/purview-image/{quote_plus(token)}"
-    canonical_url = preview.canonical_url or ""
-    target_url = preview.target_url or canonical_url
-    theme_color = preview.theme_color or "#ffffff"
+        # Cache for a reasonable time - images are static; messengers also cache aggressively.
+        headers = {
+            "Content-Type": content_type,
+            "Cache-Control": "public, max-age=604800, immutable"  # 7 days
+        }
 
-    # Make image_url absolute for OG fetchers (they need an absolute URL).
-    # We build absolute using the Host header (Azure will include).
-    # Using relative paths may break OG fetchers, so we use the full origin if possible.
-    # We'll insert absolute URL in meta by relying on the Host header at request-time.
-    # To simplify, set full URL via protocol + host if available in JS-less environment:
-    # We'll let Azure / clients resolve relative URL by creating absolute URL in meta tag using window.location if needed,
-    # but safe route: include absolute path with 'https://' + host if host is available.
-    # However since we are server-side, the Host isn't passed here — the purview fetchers will accept absolute public function URL.
-    # Best practice: build based on known function host if set in env:
-    FUNCTION_HOST = (os.getenv("FUNCTION_HOST") or "").rstrip("/")  # optional env override
+        return func.HttpResponse(body=data, status_code=200, headers=headers, mimetype=content_type)
 
-    if FUNCTION_HOST:
-        og_image_url = FUNCTION_HOST + image_endpoint
-    else:
-        # Fallback to relative URL — most scrapers will resolve it from the request URL.
-        og_image_url = image_endpoint
-
-    # Inline HTML (same look and feel you had), plus hero image referencing internal endpoint
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8" />
-    <title>{title}</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="description" content="{description}" />
-    <meta name="theme-color" content="{theme_color}" />
-    <link rel="canonical" href="{canonical_url}" />
-
-    <!-- Open Graph -->
-    <meta property="og:type" content="website" />
-    <meta property="og:title" content="{title}" />
-    <meta property="og:description" content="{description}" />
-    <meta property="og:url" content="{canonical_url}" />
-    <meta property="og:image" content="{og_image_url}" />
-
-    <!-- Twitter -->
-    <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="{title}" />
-    <meta name="twitter:description" content="{description}" />
-    <meta name="twitter:image" content="{og_image_url}" />
-
-    <style>
-        body {{
-            margin: 0;
-            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto;
-            background: #050816;
-            color: #f4f4f5;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            min-height: 100vh;
-            flex-direction: column;
-        }}
-
-        .hero {{
-            width: 100%;
-            max-width: 480px;
-            margin-bottom: 1.5rem;
-            border-radius: 1rem;
-            overflow: hidden;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.45);
-        }}
-
-        .hero img {{
-            width: 100%;
-            display: block;
-        }}
-
-        .card {{
-            max-width: 480px;
-            padding: 1.5rem;
-            border-radius: 1.25rem;
-            background: radial-gradient(circle at top, #111827 0, #020617 55%);
-            box-shadow:
-                0 18px 45px rgba(0, 0, 0, 0.6),
-                0 0 0 1px rgba(148, 163, 184, 0.2);
-        }}
-
-        .card-title {{
-            font-size: 1.3rem;
-            font-weight: 600;
-            margin-bottom: 0.5rem;
-        }}
-
-        .card-desc {{
-            font-size: 1rem;
-            color: #d1d5db;
-            margin-bottom: 1.25rem;
-        }}
-
-        .card-button {{
-            padding: 0.65rem 1.2rem;
-            border-radius: 999px;
-            background: {theme_color};
-            color: #0b1020;
-            font-weight: 600;
-            font-size: 0.95rem;
-            text-decoration: none;
-        }}
-    </style>
-</head>
-
-<body>
-
-    <!-- Hero image is served by internal image endpoint -->
-    <div class="hero">
-        <img src="{image_endpoint}" alt="Offer Preview" />
-    </div>
-
-    <main class="card">
-        <div class="card-title">{title}</div>
-        <div class="card-desc">{description}</div>
-        <a class="card-button" href="{target_url}">
-            Check my offer ↗
-        </a>
-    </main>
-
-</body>
-</html>
-"""
+    except Exception:
+        logging.exception("[Image] Unhandled error")
+        return func.HttpResponse("Image error", status_code=500)
