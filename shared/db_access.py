@@ -1,14 +1,12 @@
 """
-shared/db_access.py — Purview V1 (FINAL PRODUCTION-STABLE VERSION)
+shared/db_access.py — Purview V1 (FINAL FIXED VERSION)
 
-This version includes:
- - Correct absolute URL building (preserves /api)
- - Correct OData filter encoding (spaces → %20, quotes preserved)
- - Removes $top (your DAB rejects it)
- - Full URL logging before request
- - Full body logging for HTTP 400 from DAB
- - Lender JSON caching
- - Zero SQL, zero pyodbc
+Fixes:
+ - Correct ZIP filesystem path (parents[1] instead of parents[2])
+ - Proper lender JSON loading
+ - DAB lookup (no $top)
+ - Detailed diagnostic logging
+ - TTL lender config caching
 """
 
 import os
@@ -44,7 +42,14 @@ DAB_BACKOFF = float(os.getenv("DAB_BACKOFF", "0.25"))
 LENDER_CACHE_TTL = int(os.getenv("LENDER_CACHE_TTL", "3600"))
 LENDER_CACHE_MAX = int(os.getenv("LENDER_CACHE_MAX", "128"))
 
-FUNCTION_ROOT = Path(__file__).resolve().parents[2]
+# -----------------------------------------------------
+# CRITICAL FIX: Correct Azure mounted ZIP root
+# -----------------------------------------------------
+
+# __file__ = /home/site/wwwroot/shared/db_access.py
+# parents[1] = /home/site/wwwroot  ← THE CORRECT ROOT
+FUNCTION_ROOT = Path(__file__).resolve().parents[1]
+
 LENDER_JSON_DIR = FUNCTION_ROOT / "redirect_previews" / "lenders"
 
 # -----------------------------------------------------
@@ -77,6 +82,7 @@ class LruTtlCache:
             while len(self.store) > self.max_size:
                 self.store.popitem(last=False)
 
+
 _lender_cache = LruTtlCache(LENDER_CACHE_MAX, LENDER_CACHE_TTL)
 
 # -----------------------------------------------------
@@ -101,6 +107,7 @@ def _load_lender_json(lender: str) -> Optional[Dict[str, Any]]:
         return cached
 
     path = LENDER_JSON_DIR / f"{norm}_default.json"
+
     if not path.exists():
         logging.warning("[Purview] Missing lender JSON: %s", path)
         return None
@@ -111,29 +118,25 @@ def _load_lender_json(lender: str) -> Optional[Dict[str, Any]]:
             _lender_cache.set(norm, data)
             return data
     except:
-        logging.exception("[Purview] Failed loading lender json: %s", path)
+        logging.exception("[Purview] Failed loading lender JSON: %s", path)
         return None
 
 # -----------------------------------------------------
-# CORRECT DAB URL BUILDER (NO $top)
+# DAB URL BUILDER (NO $top)
 # -----------------------------------------------------
 
 def _build_dab_url_for_token(token: str) -> str:
     """
     FINAL WORKING VERSION:
-      - DAB_BASE_URL must include /api
-      - DO NOT start relative path with "/" → urljoin would drop /api
-      - DAB does NOT support $top → remove it
-      - Encode spaces as %20, preserve quotes
+    - DAB_BASE_URL must include /api
+    - DO NOT start relative path with "/" (urljoin would drop /api)
+    - DAB does NOT support $top → removed
     """
-
     raw_filter = f"token eq '{token}'"
     encoded_filter = raw_filter.replace(" ", "%20")
 
-    # NO leading slash, NO $top
     relative = f"{DAB_REDIRECTS_PATH.strip('/')}?$filter={encoded_filter}"
 
-    # urljoin preserves /api when relative has no leading slash
     return urljoin(DAB_BASE_URL.rstrip('/') + "/", relative)
 
 # -----------------------------------------------------
@@ -142,7 +145,6 @@ def _build_dab_url_for_token(token: str) -> str:
 
 def _http_get(url: str) -> Optional[str]:
     ctx = ssl.create_default_context()
-
     req = request.Request(url, method="GET")
     req.add_header("Accept", "application/json")
     req.add_header("User-Agent", "duit-purview-v1")
@@ -152,7 +154,6 @@ def _http_get(url: str) -> Optional[str]:
             if resp.status == 200:
                 return resp.read().decode("utf-8")
 
-            # Log body for >= 400
             body = resp.read().decode("utf-8", errors="ignore")
             logging.warning("[Purview][DAB] HTTP %d body=%s", resp.status, body)
             return None
@@ -171,6 +172,7 @@ def _http_get(url: str) -> Optional[str]:
         logging.warning("[Purview][DAB] Exception: %s", ex)
         return None
 
+
 def _http_get_with_retries(url: str) -> Optional[str]:
     for attempt in range(DAB_RETRIES + 1):
         body = _http_get(url)
@@ -187,7 +189,6 @@ def _http_get_with_retries(url: str) -> Optional[str]:
 def _dab_lookup(token: str) -> Optional[Dict[str, Any]]:
     url = _build_dab_url_for_token(token)
 
-    # CRITICAL: Log the exact URL
     logging.error("[Purview][DAB] GET %s", url)
 
     body = _http_get_with_retries(url)
@@ -229,7 +230,7 @@ def _dab_lookup(token: str) -> Optional[Dict[str, Any]]:
     }
 
 # -----------------------------------------------------
-# PUBLIC ENTRYPOINT
+# PUBLIC ENTRY
 # -----------------------------------------------------
 
 def get_redirect_preview(token: Optional[str]) -> Optional[RedirectPreview]:
