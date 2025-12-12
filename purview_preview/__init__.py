@@ -1,7 +1,7 @@
 # purview_preview/__init__.py
 import logging
 import azure.functions as func
-
+import os
 from shared.db_access import get_redirect_preview
 from urllib.parse import quote_plus
 
