@@ -1,3 +1,4 @@
 azure-functions
-azure-data-tables
 azure-storage-blob
+azure-data-tables    # if you need it elsewhere, optional
+# azure-identity  <- optional; if you add it, managed identity is used automatically
