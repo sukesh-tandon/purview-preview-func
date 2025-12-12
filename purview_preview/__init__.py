@@ -1,14 +1,15 @@
+# purview_preview/__init__.py
 import logging
 import azure.functions as func
 
 from shared.db_access import get_redirect_preview
-
+from urllib.parse import quote_plus
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
     """
     Azure Function entry point.
+    Route: purview-preview/{token}
     """
-
     try:
         logging.info("PURVIEW-V1 request received")
 
@@ -19,13 +20,12 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             or req.params.get("t")
         )
 
-        # --------------------------------------------------------------
-        # HEALTH CHECK / ALWAYS-ON BLOCKERS (Azure calls every 10 sec)
-        # --------------------------------------------------------------
+        # Health probes / always-on
         if token in (None, "", "health", "favicon.ico", "warmup", "ready"):
             return func.HttpResponse(status_code=204)
 
         if not token:
+            logging.warning("No token provided in route or query.")
             return func.HttpResponse(
                 "Invalid link: token missing",
                 status_code=400,
@@ -42,8 +42,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="text/plain",
             )
 
-        html = _build_html(preview)
-
+        html = _build_html(preview, token)
         return func.HttpResponse(
             html,
             status_code=200,
@@ -51,7 +50,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             headers={"Cache-Control": "public, max-age=60"},
         )
 
-    except Exception:
+    except Exception as exc:
         logging.exception("PURVIEW-V1: unhandled exception")
         return func.HttpResponse(
             "Preview service temporarily unavailable.",
@@ -60,45 +59,61 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         )
 
 
-# ====================================================================
-# INTERNAL HELPERS
-# ====================================================================
-
-def _build_html(preview) -> str:
+def _build_html(preview, token) -> str:
     """
     Builds the on-screen Purview page + OG tags.
+    Uses internal token-based image endpoint for og:image.
     """
 
     title = preview.title or ""
     description = preview.description or ""
-    image_url = preview.image_url or ""
+    # OG image now points to our internal endpoint which serves the blob
+    # we url-quote token so it is safe in path
+    image_endpoint = f"/api/purview-image/{quote_plus(token)}"
     canonical_url = preview.canonical_url or ""
     target_url = preview.target_url or canonical_url
     theme_color = preview.theme_color or "#ffffff"
 
+    # Make image_url absolute for OG fetchers (they need an absolute URL).
+    # We build absolute using the Host header (Azure will include).
+    # Using relative paths may break OG fetchers, so we use the full origin if possible.
+    # We'll insert absolute URL in meta by relying on the Host header at request-time.
+    # To simplify, set full URL via protocol + host if available in JS-less environment:
+    # We'll let Azure / clients resolve relative URL by creating absolute URL in meta tag using window.location if needed,
+    # but safe route: include absolute path with 'https://' + host if host is available.
+    # However since we are server-side, the Host isn't passed here — the purview fetchers will accept absolute public function URL.
+    # Best practice: build based on known function host if set in env:
+    FUNCTION_HOST = (os.getenv("FUNCTION_HOST") or "").rstrip("/")  # optional env override
+
+    if FUNCTION_HOST:
+        og_image_url = FUNCTION_HOST + image_endpoint
+    else:
+        # Fallback to relative URL — most scrapers will resolve it from the request URL.
+        og_image_url = image_endpoint
+
+    # Inline HTML (same look and feel you had), plus hero image referencing internal endpoint
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="utf-8" />
     <title>{title}</title>
-
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="description" content="{description}" />
     <meta name="theme-color" content="{theme_color}" />
     <link rel="canonical" href="{canonical_url}" />
 
-    <!-- OG -->
+    <!-- Open Graph -->
     <meta property="og:type" content="website" />
     <meta property="og:title" content="{title}" />
     <meta property="og:description" content="{description}" />
     <meta property="og:url" content="{canonical_url}" />
-    <meta property="og:image" content="{image_url}" />
+    <meta property="og:image" content="{og_image_url}" />
 
     <!-- Twitter -->
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content="{title}" />
     <meta name="twitter:description" content="{description}" />
-    <meta name="twitter:image" content="{image_url}" />
+    <meta name="twitter:image" content="{og_image_url}" />
 
     <style>
         body {{
@@ -159,14 +174,13 @@ def _build_html(preview) -> str:
             text-decoration: none;
         }}
     </style>
-
 </head>
 
 <body>
 
-    <!-- NEW: Lender-specific hero/banner image -->
+    <!-- Hero image is served by internal image endpoint -->
     <div class="hero">
-        <img src="{image_url}" alt="Offer Preview" />
+        <img src="{image_endpoint}" alt="Offer Preview" />
     </div>
 
     <main class="card">
