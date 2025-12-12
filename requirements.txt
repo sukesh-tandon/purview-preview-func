@@ -1,5 +1,3 @@
 azure-functions
-azure-storage-blob
-azure-data-tables    # if you need it elsewhere, optional
-# azure-identity  <- optional; if you add it, managed identity is used automatically
-# force install Fri Dec 12 18:55:55 IST 2025
+azure-storage-blob==12.19.0
+azure-identity==1.17.1
