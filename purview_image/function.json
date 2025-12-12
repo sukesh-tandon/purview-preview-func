@@ -3,16 +3,16 @@
   "bindings": [
     {
       "authLevel": "anonymous",
-      "name": "req",
       "type": "httpTrigger",
       "direction": "in",
-      "route": "purview-image/{token}",
+      "name": "req",
+      "route": "purview-image/{lender}",
       "methods": [ "get" ]
     },
     {
-      "name": "$return",
       "type": "http",
-      "direction": "out"
+      "direction": "out",
+      "name": "$return"
     }
   ]
 }
